@@ -83,6 +83,27 @@ public sealed class PgSqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc/>
+    public async Task RefreshStatistics(CancellationToken cancellationToken)
+    {
+        if (DbContextFactory is null)
+        {
+            return;
+        }
+
+        var context = await DbContextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (context.ConfigureAwait(false))
+        {
+            if (context.Database.IsNpgsql())
+            {
+                // Plain ANALYZE only refreshes planner statistics; unlike VACUUM it does not reclaim space,
+                // so it stays cheap enough to run after every library scan.
+                await context.Database.ExecuteSqlRawAsync("ANALYZE", cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("PostgreSQL planner statistics refreshed");
+            }
+        }
+    }
+
+    /// <inheritdoc/>
     public void OnModelCreating(ModelBuilder modelBuilder)
     {
         // Use C collation for consistent case-sensitive behavior matching SQLite BINARY
