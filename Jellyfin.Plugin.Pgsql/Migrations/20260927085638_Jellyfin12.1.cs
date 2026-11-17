@@ -109,8 +109,10 @@ namespace Jellyfin.Plugin.Pgsql.Migrations
             // PostgreSQL has no implicit text -> uuid cast, so ALTER ... TYPE uuid needs USING (42804).
             // 10.11 stored "no owner/version" as the text Guid.Empty; 12.x expects NULL, and the
             // self-referencing FK added below rejects 00000000-... since no such item exists.
-            migrationBuilder.Sql("ALTER TABLE \"BaseItems\" ALTER COLUMN \"PrimaryVersionId\" TYPE uuid USING NULLIF(\"PrimaryVersionId\", '00000000-0000-0000-0000-000000000000')::uuid;");
-            migrationBuilder.Sql("ALTER TABLE \"BaseItems\" ALTER COLUMN \"OwnerId\" TYPE uuid USING NULLIF(\"OwnerId\", '00000000-0000-0000-0000-000000000000')::uuid;");
+            // Like the SQLite migrations, anything that is not a well-formed Guid (with or without hyphens, any case)
+            // becomes NULL: a bare ::uuid cast would abort the whole upgrade on the first malformed value (22P02).
+            migrationBuilder.Sql("ALTER TABLE \"BaseItems\" ALTER COLUMN \"PrimaryVersionId\" TYPE uuid USING NULLIF(CASE WHEN \"PrimaryVersionId\" ~ '^[0-9A-Fa-f]{8}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{12}$' THEN \"PrimaryVersionId\"::uuid END, '00000000-0000-0000-0000-000000000000'::uuid);");
+            migrationBuilder.Sql("ALTER TABLE \"BaseItems\" ALTER COLUMN \"OwnerId\" TYPE uuid USING NULLIF(CASE WHEN \"OwnerId\" ~ '^[0-9A-Fa-f]{8}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{12}$' THEN \"OwnerId\"::uuid END, '00000000-0000-0000-0000-000000000000'::uuid);");
 
             // The SQLite SortOrder fix-up (numbering null SortOrders by rowid) is not carried over: on
             // PostgreSQL it ran before LinkedChildren is created, and there is no rowid. The table is
@@ -276,6 +278,20 @@ namespace Jellyfin.Plugin.Pgsql.Migrations
                 table: "LinkedChildren",
                 columns: new[] { "ParentId", "ChildType" });
 
+            // 10.11 left OwnerIds pointing at items that have since been deleted, and the FK below rejects those (23503).
+            // Repoint them to the placeholder item like the SQLite AddForeignKeyToOwnerId migration does; if a database
+            // somehow lacks the placeholder, clear them instead so the upgrade can still go through.
+            migrationBuilder.Sql(
+                """
+                UPDATE "BaseItems" AS Child
+                SET "OwnerId" = CASE
+                    WHEN EXISTS (SELECT 1 FROM "BaseItems" WHERE "Id" = '00000000-0000-0000-0000-000000000001')
+                    THEN '00000000-0000-0000-0000-000000000001'::uuid
+                END
+                WHERE Child."OwnerId" IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM "BaseItems" AS Owner WHERE Owner."Id" = Child."OwnerId");
+                """);
+
             migrationBuilder.AddForeignKey(
                 name: "FK_BaseItems_BaseItems_OwnerId",
                 table: "BaseItems",
@@ -295,6 +311,41 @@ namespace Jellyfin.Plugin.Pgsql.Migrations
             migrationBuilder.Sql("CREATE OR REPLACE FUNCTION uuid_larger(a uuid, b uuid) RETURNS uuid LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS 'SELECT CASE WHEN a >= b THEN a ELSE b END';");
             migrationBuilder.Sql("CREATE OR REPLACE AGGREGATE min(uuid) (SFUNC = uuid_smaller, STYPE = uuid, COMBINEFUNC = uuid_smaller, SORTOP = <, PARALLEL = SAFE);");
             migrationBuilder.Sql("CREATE OR REPLACE AGGREGATE max(uuid) (SFUNC = uuid_larger, STYPE = uuid, COMBINEFUNC = uuid_larger, SORTOP = >, PARALLEL = SAFE);");
+
+            // The StripEmbeddedLinkedChildren code migration runs raw SQLite SQL against "BaseItems"."Data" (text) on every
+            // provider, and PostgreSQL has neither json_valid nor json_remove (42883), so upgrades from 10.11 fail there.
+            // These mirror the SQLite semantics it relies on: json_valid returns 1/0 (NULL for NULL), and json_remove
+            // drops top-level '$.Key' paths. Key order and whitespace are not preserved, which System.Text.Json ignores.
+            migrationBuilder.Sql(
+                """
+                CREATE OR REPLACE FUNCTION json_valid(value text) RETURNS integer
+                LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$
+                BEGIN
+                    PERFORM value::json;
+                    RETURN 1;
+                EXCEPTION WHEN invalid_text_representation THEN
+                    RETURN 0;
+                END
+                $$;
+                """);
+            migrationBuilder.Sql(
+                """
+                CREATE OR REPLACE FUNCTION json_remove(value text, VARIADIC paths text[]) RETURNS text
+                LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE AS $$
+                DECLARE
+                    result jsonb := value::jsonb;
+                    path text;
+                BEGIN
+                    FOREACH path IN ARRAY paths LOOP
+                        IF path !~ '^\$\.[A-Za-z0-9_]+$' THEN
+                            RAISE EXCEPTION 'json_remove: only top-level $.Key paths are supported, got %', path;
+                        END IF;
+                        result := result - substr(path, 3);
+                    END LOOP;
+                    RETURN result::text;
+                END
+                $$;
+                """);
         }
 
         /// <inheritdoc />
